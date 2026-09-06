@@ -6,14 +6,13 @@ import os
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import SAGEConv, global_mean_pool
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 
 from audio_features import process_track
 from graph_builder import build_segment_graph, graph_to_arrays
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-N_SAMPLES = 600
+N_SAMPLES = 2000
 GENRE_TAGS = ["classical", "rock", "jazz", "electronic", "pop", "ambient",
               "metal", "folk", "country", "techno"]
 BATCH_SIZE = 16
@@ -34,16 +33,12 @@ def track_to_pyg_graph(mp3_path):
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
-def build_dataset(n_samples=N_SAMPLES):
-    annotations = pd.read_csv("data/raw/magnatagatune_annotations.csv", sep="\t")
-    audio_dir = "data/raw/magnatagatune_audio"
-
-    mask = annotations[GENRE_TAGS].sum(axis=1) > 0
-    annotations = annotations[mask].reset_index(drop=True)
+def build_split_dataset(annotations, audio_dir, clip_ids, n_samples):
+    subset = annotations[annotations["clip_id"].isin(clip_ids)].reset_index(drop=True)
 
     graphs = []
     count = 0
-    for _, row in annotations.iterrows():
+    for _, row in subset.iterrows():
         if count >= n_samples:
             break
         mp3_path = os.path.join(audio_dir, row["mp3_path"])
@@ -56,10 +51,32 @@ def build_dataset(n_samples=N_SAMPLES):
         graph.y = label.unsqueeze(0)
         graphs.append(graph)
         count += 1
-        if count % 50 == 0:
+        if count % 100 == 0:
             print(f"Built {count}/{n_samples} graphs")
 
     return graphs
+
+def build_dataset(n_samples=N_SAMPLES):
+    annotations = pd.read_csv("data/raw/magnatagatune_annotations.csv", sep="\t")
+    audio_dir = "data/raw/magnatagatune_audio"
+
+    mask = annotations[GENRE_TAGS].sum(axis=1) > 0
+    annotations = annotations[mask].reset_index(drop=True)
+
+    train_ids = set(pd.read_csv("data/splits/train_ids.csv")["clip_id"])
+    val_ids = set(pd.read_csv("data/splits/val_ids.csv")["clip_id"])
+
+    n_train = int(n_samples * 0.8)
+    n_val = n_samples - n_train
+
+    print("Building train graphs...")
+    train_graphs = build_split_dataset(annotations, audio_dir, train_ids, n_train)
+    print("Building val graphs...")
+    val_graphs = build_split_dataset(annotations, audio_dir, val_ids, n_val)
+
+    return train_graphs, val_graphs
+
+
 
 
 class GNNTagClassifier(nn.Module):
@@ -112,10 +129,9 @@ def evaluate(model, loader, criterion, threshold=0.5):
 
 def main():
     print("Building dataset...")
-    graphs = build_dataset()
-    print(f"Total graphs built: {len(graphs)}")
+    train_graphs, val_graphs = build_dataset()
+    print(f"Train graphs: {len(train_graphs)}, Val graphs: {len(val_graphs)}")
 
-    train_graphs, val_graphs = train_test_split(graphs, test_size=0.2, random_state=42)
     train_loader = DataLoader(train_graphs, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_graphs, batch_size=BATCH_SIZE)
 
@@ -123,14 +139,21 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.BCEWithLogitsLoss()
 
+    best_macro_f1 = 0
+
     for epoch in range(EPOCHS):
         train_loss = train_epoch(model, train_loader, optimizer, criterion)
         val_loss, macro_f1, micro_f1 = evaluate(model, val_loader, criterion)
         print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | Macro-F1: {macro_f1:.4f} | Micro-F1: {micro_f1:.4f}")
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            torch.save(model.state_dict(), "results/gnn_best.pt")
 
-    torch.save(model.state_dict(), "results/gnn_tag_classifier.pt")
-    print("Model saved to results/gnn_tag_classifier.pt")
+
+    print(f"Best Macro-F1: {best_macro_f1:.4f}")
+    print("Best model saved to results/gnn_best.pt")
+
 
 
 if __name__ == "__main__":
