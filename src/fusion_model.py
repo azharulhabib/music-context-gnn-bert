@@ -7,14 +7,13 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import SAGEConv, global_mean_pool
 from transformers import BertTokenizer, BertModel
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 
 from audio_features import process_track
 from graph_builder import build_segment_graph, graph_to_arrays
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-N_SAMPLES = 600
+N_SAMPLES = 2000
 GENRE_TAGS = ["classical", "rock", "jazz", "electronic", "pop", "ambient",
               "metal", "folk", "country", "techno"]
 BATCH_SIZE = 8
@@ -42,19 +41,12 @@ def build_pseudo_caption(row, non_genre_tags):
     return " ".join(present)
 
 
-def build_dataset(n_samples=N_SAMPLES):
-    annotations = pd.read_csv("data/raw/magnatagatune_annotations.csv", sep="\t")
-    audio_dir = "data/raw/magnatagatune_audio"
-
-    all_tag_cols = [c for c in annotations.columns if c not in ("clip_id", "mp3_path")]
-    non_genre_tags = [t for t in all_tag_cols if t not in GENRE_TAGS]
-
-    mask = annotations[GENRE_TAGS].sum(axis=1) > 0
-    annotations = annotations[mask].reset_index(drop=True)
+def build_split_dataset(annotations, audio_dir, non_genre_tags, clip_ids, n_samples):
+    subset = annotations[annotations["clip_id"].isin(clip_ids)].reset_index(drop=True)
 
     graphs, captions = [], []
     count = 0
-    for _, row in annotations.iterrows():
+    for _, row in subset.iterrows():
         if count >= n_samples:
             break
         mp3_path = os.path.join(audio_dir, row["mp3_path"])
@@ -69,10 +61,32 @@ def build_dataset(n_samples=N_SAMPLES):
         graphs.append(graph)
         captions.append(caption)
         count += 1
-        if count % 50 == 0:
+        if count % 100 == 0:
             print(f"Built {count}/{n_samples} samples")
-
     return graphs, captions
+
+def build_dataset(n_samples=N_SAMPLES):
+    annotations = pd.read_csv("data/raw/magnatagatune_annotations.csv", sep="\t")
+    audio_dir = "data/raw/magnatagatune_audio"
+
+    all_tag_cols = [c for c in annotations.columns if c not in ("clip_id", "mp3_path")]
+    non_genre_tags = [t for t in all_tag_cols if t not in GENRE_TAGS]
+
+    mask = annotations[GENRE_TAGS].sum(axis=1) > 0
+    annotations = annotations[mask].reset_index(drop=True)
+
+    train_ids = set(pd.read_csv("data/splits/train_ids.csv")["clip_id"])
+    val_ids = set(pd.read_csv("data/splits/val_ids.csv")["clip_id"])
+
+    n_train = int(n_samples * 0.8)
+    n_val = n_samples - n_train
+
+    print("Building train samples...")
+    train_graphs, train_captions = build_split_dataset(annotations, audio_dir, non_genre_tags, train_ids, n_train)
+    print("Building val samples...")
+    val_graphs, val_captions = build_split_dataset(annotations, audio_dir, non_genre_tags, val_ids, n_val)
+
+    return train_graphs, train_captions, val_graphs, val_captions
 
 
 class FusionModel(nn.Module):
@@ -173,16 +187,8 @@ def evaluate(model, loader, criterion, threshold=0.5):
 
 def main():
     print("Building dataset...")
-    graphs, captions = build_dataset()
-    print(f"Total samples: {len(graphs)}")
-
-    idx = list(range(len(graphs)))
-    train_idx, val_idx = train_test_split(idx, test_size=0.2, random_state=42)
-
-    train_graphs = [graphs[i] for i in train_idx]
-    train_captions = [captions[i] for i in train_idx]
-    val_graphs = [graphs[i] for i in val_idx]
-    val_captions = [captions[i] for i in val_idx]
+    train_graphs, train_captions, val_graphs, val_captions = build_dataset()
+    print(f"Train: {len(train_graphs)}, Val: {len(val_graphs)}")
 
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     train_ds = FusionDataset(train_graphs, train_captions, tokenizer)
@@ -195,14 +201,19 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     criterion = nn.BCEWithLogitsLoss()
 
+    best_macro_f1 = 0
+
     for epoch in range(EPOCHS):
         train_loss = train_epoch(model, train_loader, optimizer, criterion)
         val_loss, macro_f1, micro_f1 = evaluate(model, val_loader, criterion)
         print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | Macro-F1: {macro_f1:.4f} | Micro-F1: {micro_f1:.4f}")
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            torch.save(model.state_dict(), "results/fusion_best.pt")
+    print(f"Best Macro-F1: {best_macro_f1:.4f}")
+    print("Best model saved to results/fusion_best.pt")
 
-    torch.save(model.state_dict(), "results/fusion_model.pt")
-    print("Model saved to results/fusion_model.pt")
 
 
 if __name__ == "__main__":
