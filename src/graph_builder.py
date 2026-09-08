@@ -31,7 +31,6 @@ def build_segment_graph(feature_segments, tau=SIMILARITY_THRESHOLD):
 
 
 def graph_to_arrays(G):
-    """Convert a networkx graph into arrays ready for PyTorch Geometric's Data object."""
     node_features = np.array([G.nodes[i]["feat"] for i in G.nodes])
     edges = list(G.edges())
     edge_index = np.array(edges).T if edges else np.empty((2, 0), dtype=int)

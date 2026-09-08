@@ -50,7 +50,6 @@ def process_track(mp3_path):
 
 
 if __name__ == "__main__":
-    # Quick manual test on one MagnaTagATune clip before running the full batch
     annotations = pd.read_csv("data/raw/magnatagatune_annotations.csv", sep="\t")
     sample_path = annotations.iloc[0]["mp3_path"]
     full_path = os.path.join("data/raw/magnatagatune_audio", sample_path)
